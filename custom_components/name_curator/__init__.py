@@ -21,7 +21,6 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.components import persistent_notification
-from homeassistant.components.homeassistant.exposed_entities import async_should_expose
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, ServiceCall, callback
@@ -45,6 +44,8 @@ ATTR_DRY_RUN = "dry_run"
 
 NOTIFICATION_ID = "name_curator"
 NOTIFICATION_TITLE = "Name curator"
+# Assist stores its exposure flag under the conversation domain in entity options.
+ASSIST_DOMAIN = "conversation"
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 SERVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_DRY_RUN, default=False): cv.boolean})
@@ -145,7 +146,7 @@ class Curator:
         }
         devices = {
             device.id: Device(device.id, device.name, device.name_by_user, device.area_id)
-            for device in dr.async_get(self.hass).devices.values()
+            for device in dr.async_get(self.hass).devices  # iterating yields entries (2026.9+)
         }
         entities: dict[str, Entity] = {}
         for entry in er.async_get(self.hass).entities.values():
@@ -164,9 +165,14 @@ class Curator:
                 or entry.original_device_class
                 or (state.attributes.get("device_class") if state else None),
                 friendly_name=state.attributes.get("friendly_name") if state else None,
-                aliases=tuple(entry.aliases),
-                exposed_to_assist=self.options.assist_aliases
-                and async_should_expose(self.hass, "conversation", entry.entity_id),
+                # Aliases are an ordered list; Core's COMPUTED_NAME sentinel is
+                # not a str and is passed through untouched.
+                aliases=tuple(a for a in entry.aliases if isinstance(a, str)),
+                # Read the stored setting only: async_should_expose() persists a
+                # default for every entity it is asked about.
+                exposed_to_assist=bool(
+                    entry.options.get(ASSIST_DOMAIN, {}).get("should_expose", False)
+                ),
             )
         return Snapshot(areas, devices, entities)
 
@@ -238,8 +244,10 @@ class Curator:
                 entry = entities.async_get(change.entity_id)
                 if entry is None:
                     continue
+                if change.alias in entry.aliases:
+                    continue
                 entities.async_update_entity(
-                    change.entity_id, aliases=set(entry.aliases) | {change.alias}
+                    change.entity_id, aliases=[*entry.aliases, change.alias]
                 )
                 _LOGGER.info("Alias %s += %r", change.entity_id, change.alias)
         finally:
