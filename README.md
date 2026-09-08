@@ -31,6 +31,12 @@ Whenever a device is created, renamed, moved to an area, or an area is renamed:
 - **Restore on move**: if a device Name Curator shortened is later moved out of
   that area, its integration name is put back rather than leaving a bare
   *Vent Fan* with no room attached. Names you chose yourself are never restored.
+- **Follows the source**: rename the device in Zigbee2MQTT / ESPHome / the vendor
+  app and the shortened display name is re-derived from the new name instead of
+  masking it.
+- Entity display-name overrides are **one-way**: the previous override is not
+  kept, so run `name_curator.curate` with `dry_run: true` first on an existing
+  install and keep its report if you may want to revert.
 - **Every change is reported** in a persistent notification and logged at INFO.
 
 Prefix matching follows the frontend's own rule (`stripPrefixFromEntityName`):

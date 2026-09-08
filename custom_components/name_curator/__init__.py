@@ -21,6 +21,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.components import persistent_notification
+from homeassistant.components.homeassistant.exposed_entities import async_should_expose
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, ServiceCall, callback
@@ -103,9 +104,9 @@ class Curator:
         if data["action"] == "create":
             self._schedule()
         elif data["action"] == "update" and DEVICE_FIELDS & set(data.get("changes", {})):
-            if "area_id" in data["changes"]:
+            if "area_id" in data["changes"] or "name" in data["changes"]:
                 self.hass.async_create_task(
-                    self._async_handle_move(data["device_id"], data["changes"]["area_id"])
+                    self._async_handle_source_change(data["device_id"], data["changes"])
                 )
             self._schedule()
 
@@ -165,57 +166,65 @@ class Curator:
                 or entry.original_device_class
                 or (state.attributes.get("device_class") if state else None),
                 friendly_name=state.attributes.get("friendly_name") if state else None,
-                # Aliases are an ordered list; Core's COMPUTED_NAME sentinel is
-                # not a str and is passed through untouched.
+                # Ordered list; Core's COMPUTED_NAME sentinel is not a str.
                 aliases=tuple(a for a in entry.aliases if isinstance(a, str)),
-                # Read the stored setting only: async_should_expose() persists a
-                # default for every entity it is asked about.
+                # Stored Assist flag when present; otherwise leave it as a
+                # candidate and let async_curate's bounded check decide.
                 exposed_to_assist=bool(
-                    entry.options.get(ASSIST_DOMAIN, {}).get("should_expose", False)
+                    entry.options.get(ASSIST_DOMAIN, {}).get("should_expose", True)
                 ),
             )
         return Snapshot(areas, devices, entities)
 
     # -- actions -----------------------------------------------------------
 
-    async def _async_handle_move(self, device_id: str, previous_area_id: str | None) -> None:
-        """Restore a name we shortened once its device leaves that area."""
-        if previous_area_id is None:
-            return
+    async def _async_handle_source_change(self, device_id: str, changes: dict[str, Any]) -> None:
+        """React to a device leaving its area, or its integration renaming it.
+
+        Both need the *previous* value, which only the event carries, so they
+        cannot wait for the debounced sweep.
+        """
         async with self._lock:
             registry = dr.async_get(self.hass)
             device = registry.async_get(device_id)
             if device is None:
                 return
             areas = ar.async_get(self.hass)
-            previous = areas.async_get_area(previous_area_id)
-            current = areas.async_get_area(device.area_id) if device.area_id else None
-            change = logic.plan_device_move(
-                Device(device.id, device.name, device.name_by_user, device.area_id),
-                Area(previous.id, previous.name, tuple(previous.aliases)) if previous else None,
-                Area(current.id, current.name, tuple(current.aliases)) if current else None,
-                self.options,
-            )
+
+            def area(area_id: str | None) -> Area | None:
+                entry = areas.async_get_area(area_id) if area_id else None
+                return Area(entry.id, entry.name, tuple(entry.aliases)) if entry else None
+
+            view = Device(device.id, device.name, device.name_by_user, device.area_id)
+            current = area(device.area_id)
+            change = None
+            if "area_id" in changes:
+                change = logic.plan_device_move(view, area(changes["area_id"]), current, self.options)
+            if change is None and "name" in changes:
+                change = logic.plan_device_rename(view, changes["name"], current, self.options)
             if change is None:
                 return
             self._applying = True
             try:
-                registry.async_update_device(device.id, name_by_user=None)
+                registry.async_update_device(device.id, name_by_user=change.new)
             finally:
                 self._applying = False
-            _LOGGER.info(
-                "Restored %s: %r -> %r (left %s)", device.id, change.old, device.name,
-                previous.name if previous else previous_area_id,
-            )
+            _LOGGER.info("Device %s: %r -> %r (%s)", device.id, change.old, change.new or device.name, change.kind)
             if self.options.notify:
-                snapshot = self._snapshot()
-                self._notify(logic.describe(Plan(devices=[change]), snapshot))
+                self._notify(logic.describe(Plan(devices=[change]), self._snapshot()))
 
     async def async_curate(self, *, dry_run: bool = False, force_notify: bool = False) -> Plan:
         """One full pass over the registries."""
         async with self._lock:
             snapshot = self._snapshot()
             plan_ = logic.plan(snapshot, self.options)
+            if plan_.aliases:
+                # Default-aware check, bounded to entities already in the plan:
+                # async_should_expose persists a default for whatever it is asked.
+                plan_.aliases = [
+                    a for a in plan_.aliases
+                    if async_should_expose(self.hass, ASSIST_DOMAIN, a.entity_id)
+                ]
             if plan_ and not dry_run:
                 self._apply(plan_)
             if plan_ or force_notify:

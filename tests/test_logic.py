@@ -91,6 +91,26 @@ class TestMove:
         assert logic.plan_device_move(device, LIVING, None, logic.Options(restore_on_move=False)) is None
 
 
+class TestSourceRename:
+    def test_follows_integration_rename_with_prefix(self):
+        device = logic.Device("d", "Living Room Big Fan", "Vent Fan", "living_room")
+        change = logic.plan_device_rename(device, "Living Room Vent Fan", LIVING, OPTS)
+        assert change == logic.DeviceChange("d", "Vent Fan", "Big Fan")
+
+    def test_drops_override_when_new_name_has_no_prefix(self):
+        device = logic.Device("d", "Big Fan", "Vent Fan", "living_room")
+        change = logic.plan_device_rename(device, "Living Room Vent Fan", LIVING, OPTS)
+        assert change == logic.DeviceChange("d", "Vent Fan", None, kind="restore")
+
+    def test_operator_override_is_not_ours_so_untouched(self):
+        device = logic.Device("d", "Living Room Big Fan", "Couch Fan", "living_room")
+        assert logic.plan_device_rename(device, "Living Room Vent Fan", LIVING, OPTS) is None
+
+    def test_noop_when_rename_yields_same_display(self):
+        device = logic.Device("d", "Living Room: Vent Fan", "Vent Fan", "living_room")
+        assert logic.plan_device_rename(device, "Living Room Vent Fan", LIVING, OPTS) is None
+
+
 def _entity(**kw):
     base = dict(
         entity_id="light.x", device_id="d1", area_id=None, name=None,

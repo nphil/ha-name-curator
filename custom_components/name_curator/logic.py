@@ -243,6 +243,29 @@ def plan_device_move(
     return DeviceChange(device.id, device.name_by_user, None, kind="restore")
 
 
+def plan_device_rename(
+    device: Device, previous_name: str | None, area: Area | None, options: Options
+) -> DeviceChange | None:
+    """Follow the integration when it renames a device we had shortened.
+
+    ``name_by_user`` masks the integration's ``name``, so a rename done in
+    Zigbee2MQTT / ESPHome / the vendor app would otherwise never show. If the
+    current user name is exactly what we derived from the *previous* integration
+    name, re-derive it from the new one: the new name minus the area prefix, or
+    the new name itself when it carries no prefix (drop the override).
+    """
+    if not options.strip_devices or area is None or device.name_by_user is None:
+        return None
+    if not previous_name or not device.name or device.name == previous_name:
+        return None
+    if device.name_by_user != strip_prefix(previous_name, area.prefixes):
+        return None
+    new = strip_prefix(device.name, area.prefixes)
+    if new == device.name_by_user:
+        return None
+    return DeviceChange(device.id, device.name_by_user, new, kind="strip" if new else "restore")
+
+
 def plan_entity(entity: Entity, area: Area | None, options: Options) -> EntityChange | None:
     """Shorten an entity's displayed name when it does not follow its device."""
     if not options.strip_entities or area is None:
