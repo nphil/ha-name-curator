@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Name Curator",
+        "description": "Name Curator removes a device's room from its displayed name once the device is assigned to that area, so grouped dashboards stop reading \"Living Room Living Room Lights\". Entity ids are never changed. Confirm to enable it."
+      }
+    },
+    "abort": {
+      "already_configured": "Name Curator is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Name Curator options",
+        "description": "Saving reloads Name Curator and runs one pass with the new policy.",
+        "data": {
+          "strip_devices": "Shorten device names",
+          "strip_entities": "Shorten entity display names",
+          "restore_on_move": "Restore the full name when a device leaves its area",
+          "assist_aliases": "Keep the old name as an Assist alias",
+          "excluded_device_classes": "Never shorten these device classes",
+          "excluded_domains": "Never shorten these domains",
+          "notify": "Send a notification for every change",
+          "debounce_seconds": "Wait before acting"
+        },
+        "data_description": {
+          "strip_devices": "When a device's displayed name starts with its area's name (or an alias of it), set the device's user name to the remainder. The integration's own name is kept underneath.",
+          "strip_entities": "Also shorten entities whose displayed name does not follow their device: explicit name overrides, and integrations that never adopted device-based naming. Entity ids are never touched.",
+          "restore_on_move": "If a device that Name Curator shortened is moved out of that area, put its integration name back so it is not left as a bare \"Vent Fan\" with no room.",
+          "assist_aliases": "For entities exposed to Assist, add the previous friendly name as an alias so voice commands keep working.",
+          "excluded_device_classes": "Entities with one of these device classes are left alone. Doors are excluded by default because they read as \"<Location> Door\".",
+          "excluded_domains": "Entities in these domains are left alone. Automations, scripts and scenes are excluded by default: their names are chosen deliberately and are not things in a room.",
+          "notify": "Post a persistent notification listing exactly what was renamed.",
+          "debounce_seconds": "Delay after a registry change before renaming, so a device being set up settles first."
+        }
+      }
+    }
+  },
+  "services": {
+    "curate": {
+      "name": "Curate names",
+      "description": "Run one full pass over every device and entity with an area, and post the result as a notification.",
+      "fields": {
+        "dry_run": {
+          "name": "Dry run",
+          "description": "Only report what would change; write nothing."
+        }
+      }
+    }
+  }
+}
