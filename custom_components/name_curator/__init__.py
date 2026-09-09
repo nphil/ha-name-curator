@@ -249,10 +249,37 @@ class Curator:
         if self._applying:
             return
         data = event.data
-        if data["action"] == "create" or (
-            data["action"] == "update" and ENTITY_FIELDS & set(data.get("changes", {}))
-        ):
+        if data["action"] == "create":
+            # A device rename is not the only way an id ends up room-less.
+            # Core mints a new entity's id from the device's *display* name,
+            # which this integration has deliberately stripped of the room -
+            # so an entity added to a curated device later (a firmware update
+            # exposing a new sensor, an integration upgrade) is born as
+            # sensor.bluetooth_proxy_… and, across seven identical proxies,
+            # collides into …_2 …_6. The device carried no event, so only
+            # the entity's own creation can trigger the fix.
+            if self.options.rename_entity_ids:
+                task = self.hass.async_create_task(self._async_handle_new_entity(data["entity_id"]))
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
             self._schedule()
+        elif data["action"] == "update" and ENTITY_FIELDS & set(data.get("changes", {})):
+            self._schedule()
+
+    async def _async_handle_new_entity(self, entity_id: str) -> None:
+        """Bring a freshly minted entity's id to convention."""
+        # Platforms add their entities in a burst; let the whole device land.
+        await asyncio.sleep(ID_SETTLE_SECONDS)
+        async with self._lock:
+            entry = er.async_get(self.hass).async_get(entity_id)
+            if entry is None or entry.device_id is None:
+                return
+            device = dr.async_get(self.hass).async_get(entry.device_id)
+            if device is None or not (entry.area_id or device.area_id):
+                return
+            ids = await self._async_curate_ids([IdTarget(device.id)], dry_run=False)
+        if ids and self.options.notify:
+            self._report(Plan(), ids, self._snapshot(), dry_run=False)
 
     @callback
     def _area_event(self, event: Event) -> None:

@@ -1,14 +1,19 @@
 {
   "domain": "name_curator",
   "name": "Name Curator",
-  "codeowners": ["@nphil"],
+  "codeowners": [
+    "@nphil"
+  ],
   "config_flow": true,
-  "dependencies": ["homeassistant", "persistent_notification"],
+  "dependencies": [
+    "homeassistant",
+    "persistent_notification"
+  ],
   "documentation": "https://github.com/nphil/ha-name-curator",
   "integration_type": "service",
   "iot_class": "calculated",
   "issue_tracker": "https://github.com/nphil/ha-name-curator/issues",
   "requirements": [],
   "single_config_entry": true,
-  "version": "1.1.0"
+  "version": "1.1.1"
 }

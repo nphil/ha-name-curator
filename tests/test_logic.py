@@ -267,6 +267,27 @@ class TestPlanEntityId:
         assert change.new_entity_id == "sensor.nitin_s_office_standing_desk_height"
         assert change.reason == logic.ID_REASON_STALE_THING
 
+    def test_core_collision_counter_is_not_part_of_the_suffix(self):
+        # Seven "Bluetooth Proxy" devices each grew a Ghost Link Heals sensor;
+        # Core numbered the clashes. The stem is the current display name.
+        change = _plan_id(
+            "sensor.bluetooth_proxy_ghost_link_heals_4",
+            area="living_room", thing="bluetooth_proxy", suffix="ghost_link_heals",
+            stems=("living-room-bluetooth-proxy", "bluetooth_proxy"),
+        )
+        assert change is not None
+        assert change.new_entity_id == "sensor.living_room_bluetooth_proxy_ghost_link_heals"
+
+    def test_a_real_trailing_number_in_the_suffix_still_matches_verbatim(self):
+        change = _plan_id("button.uplift_desk_preset_1", suffix="preset_1")
+        assert change.new_entity_id == "button.nitin_s_office_standing_desk_preset_1"
+        # and a counter on top of it is recognised too
+        change = _plan_id("button.uplift_desk_preset_1_2", suffix="preset_1")
+        assert change.new_entity_id == "button.nitin_s_office_standing_desk_preset_1"
+
+    def test_a_number_that_is_not_a_counter_does_not_rescue_a_wrong_suffix(self):
+        assert _plan_id("sensor.uplift_desk_width_3", suffix="height") is None
+
     def test_unrecognised_id_is_never_guessed_at(self):
         # An id the operator minted by hand. It lacks the area prefix and its
         # tail is the right suffix, which is all the prototype rule looked at

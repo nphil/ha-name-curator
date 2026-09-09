@@ -93,6 +93,16 @@ UI, or an integration renames it upstream — and it considers **only the
 entities of that one device**. `name_curator.curate` (the full pass) never
 touches an id at all.
 
+A **new entity appearing on a device that is already in an area** is handled
+the same way: Core mints its id from the device's *display* name, which this
+integration has deliberately stripped of the room, so the entity is born
+room-less (and, across identical devices in different rooms, numbered
+`_2`, `_3`…). The device fires no event for that, so the entity's own creation
+does — three seconds later, once the platform has finished adding its
+siblings, the device's ids are brought to convention. Core's collision counter
+is recognised and dropped; a genuine trailing number in a name (`preset_1`)
+is kept.
+
 The UI's own rename dialog also offers to rename entity ids, with its own
 registry calls right after the device update. The curator waits three seconds
 for that to finish, then plans against what is actually in the registry — so

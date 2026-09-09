@@ -24,6 +24,7 @@ shortens "Office Canvas Lights".
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -333,6 +334,23 @@ def compose_object_id(area_slug: str, thing_slug: str, suffix_slug: str) -> str:
     return "_".join(tokens)
 
 
+_COLLISION_COUNTER = re.compile(r"_(\d+)$")
+
+
+def strip_collision_counter(object_id: str) -> str:
+    """``object_id`` without the ``_2``, ``_3``… Core appends on an id collision.
+
+    Seven Bluetooth proxies all displayed as "Bluetooth Proxy" (the room is
+    stripped from the display name on purpose) each grew a Ghost Link Heals
+    sensor in the same minute and were minted ``sensor.bluetooth_proxy_ghost_link_heals``
+    through ``…_heals_6``: Core builds a new id from the display name and
+    numbers the clashes. The counter is not part of the entity's suffix, so
+    it must not stop the id being recognised. A genuine trailing number in a
+    suffix ("preset_1", "channel_0") still matches first, verbatim.
+    """
+    return _COLLISION_COUNTER.sub("", object_id, count=1)
+
+
 def plan_entity_id(
     entity_id: str,
     *,
@@ -383,7 +401,8 @@ def plan_entity_id(
                 from_integration = index == 0
     if not matched:
         return None
-    if object_id.removeprefix(matched).removeprefix("_") != suffix_slug:
+    remainder = object_id.removeprefix(matched).removeprefix("_")
+    if remainder != suffix_slug and strip_collision_counter(remainder) != suffix_slug:
         return None
 
     new_entity_id = f"{domain}.{conventional}"
