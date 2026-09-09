@@ -13,6 +13,10 @@ curate_ids:
       selector:
         device:
           multiple: true
+    previous_name:
+      required: false
+      selector:
+        text:
     dry_run:
       required: false
       default: true

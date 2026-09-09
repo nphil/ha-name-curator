@@ -59,6 +59,10 @@
           "name": "Devices",
           "description": "The devices to fix. Only these devices' entities are considered."
         },
+        "previous_name": {
+          "name": "Previous name",
+          "description": "A display name the device used to have, when its ids still spell it (e.g. \"Temperature Humidity Display\", with or without the room). The registry keeps no name history, so this is the only way a retroactive fix can recognise such an id; nothing is inferred."
+        },
         "dry_run": {
           "name": "Dry run",
           "description": "Only report what would change; write nothing. On by default, because an id rename cannot be undone from the notification."

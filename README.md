@@ -197,6 +197,21 @@ notification. `device_id` is required: called without one it raises an error
 rather than sweeping the house — see [It never guesses](#it-never-guesses).
 Everything else is identical to the event path, refusals included.
 
+Without an event there is no previous name to recognise, so on its own the
+service only fixes ids minted from the *integration's* name (still the
+device's `name` in the registry). An id that spells a display name the device
+used to have — `sensor.master_bedroom_temperature_humidity_display_battery` on
+a device now called "Climate" — needs you to state that name; the registry
+keeps no history and the curator will not infer one:
+
+```yaml
+action: name_curator.curate_ids
+data:
+  device_id: 4f9c1e0a2b7d48c3a1e5f60d9b8c7a21
+  previous_name: Temperature Humidity Display
+  dry_run: false
+```
+
 ## Development
 
 Decisions live in `custom_components/name_curator/logic.py` with no Home

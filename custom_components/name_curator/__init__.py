@@ -59,6 +59,7 @@ SERVICE_CURATE = "curate"
 SERVICE_CURATE_IDS = "curate_ids"
 ATTR_DRY_RUN = "dry_run"
 ATTR_DEVICE_ID = "device_id"
+ATTR_PREVIOUS_NAME = "previous_name"
 
 NOTIFICATION_ID = "name_curator"
 NOTIFICATION_TITLE = "Name curator"
@@ -76,6 +77,10 @@ SERVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_DRY_RUN, default=False): cv.boole
 CURATE_IDS_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_DEVICE_ID, default=list): vol.All(cv.ensure_list, [cv.string]),
+        # The registry keeps no name history, so a retroactive fix of an id
+        # that spells a *former* display name needs the operator to state
+        # that name. It is then a stem exactly as an event would supply it.
+        vol.Optional(ATTR_PREVIOUS_NAME): cv.string,
         # Defaults to reporting: an id rename cannot be undone from a notification.
         vol.Optional(ATTR_DRY_RUN, default=True): cv.boolean,
     }
@@ -534,11 +539,14 @@ class Curator:
             self._applying = False
         return ids
 
-    async def async_curate_ids(self, device_ids: Sequence[str], *, dry_run: bool) -> IdPlan:
+    async def async_curate_ids(
+        self, device_ids: Sequence[str], *, dry_run: bool, previous_name: str | None = None
+    ) -> IdPlan:
         """The ``curate_ids`` service: retroactive fix for named devices only."""
         async with self._lock:
             ids = await self._async_curate_ids(
-                [IdTarget(device_id) for device_id in device_ids], dry_run=dry_run
+                [IdTarget(device_id, (previous_name,)) for device_id in device_ids],
+                dry_run=dry_run,
             )
             _LOGGER.info(
                 "%s%d entity id(s), %d refused, %d reference(s) rewritten",
@@ -659,7 +667,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     },
                 )
             for active in list(hass.data[DOMAIN].values()):
-                await active.async_curate_ids(device_ids, dry_run=call.data[ATTR_DRY_RUN])
+                await active.async_curate_ids(
+                    device_ids,
+                    dry_run=call.data[ATTR_DRY_RUN],
+                    previous_name=call.data.get(ATTR_PREVIOUS_NAME),
+                )
 
         hass.services.async_register(
             DOMAIN, SERVICE_CURATE_IDS, _curate_ids, schema=CURATE_IDS_SCHEMA
