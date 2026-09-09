@@ -135,6 +135,10 @@ class IdPlan:
     # file it re-found, or a write that failed. Reported separately so the
     # notification never claims a file was rewritten when it was not.
     by_hand: tuple[references.Reference, ...] = ()
+    # Dry run only: the rewritable references a real run would touch, so the
+    # preview shows the blast radius rather than leaving it to be discovered
+    # by performing the rename.
+    would_rewrite: tuple[references.Reference, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(self.renames or self.refusals)
@@ -164,6 +168,11 @@ def describe_ids(ids: IdPlan, *, dry_run: bool = False) -> str:
         lines.append(f"**References** ({len(ids.rewritten)} {verb} rewritten)")
         for kind, count in sorted(counts.items()):
             lines.append(f"- {kind}: {count}")
+    if ids.would_rewrite:
+        lines.append("")
+        lines.append(f"**References that would be rewritten** ({len(ids.would_rewrite)})")
+        for reference in ids.would_rewrite:
+            lines.append(f"- {reference.kind}: {reference.where}")
     if ids.by_hand:
         lines.append("")
         lines.append(f"**References to fix by hand** ({len(ids.by_hand)})")
@@ -183,6 +192,9 @@ class Curator:
         self._pending: CALLBACK_TYPE | None = None
         self._applying = False
         self._unsubs: list[CALLBACK_TYPE] = []
+        # Source-change handlers sleep through the settle window; an unload
+        # must not leave one to wake on a dead curator and rename anyway.
+        self._inflight: set[asyncio.Task[None]] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -210,6 +222,9 @@ class Curator:
         if self._pending:
             self._pending()
             self._pending = None
+        for task in list(self._inflight):
+            task.cancel()
+        self._inflight.clear()
 
     # -- events ------------------------------------------------------------
 
@@ -222,9 +237,11 @@ class Curator:
             self._schedule()
         elif data["action"] == "update" and DEVICE_FIELDS & set(data.get("changes", {})):
             if SOURCE_FIELDS & set(data["changes"]):
-                self.hass.async_create_task(
+                task = self.hass.async_create_task(
                     self._async_handle_source_change(data["device_id"], data["changes"])
                 )
+                self._inflight.add(task)
+                task.add_done_callback(self._inflight.discard)
             self._schedule()
 
     @callback
@@ -407,7 +424,11 @@ class Curator:
         """Candidate id renames for the given devices, and nothing else."""
         devices = dr.async_get(self.hass)
         entities = er.async_get(self.hass)
-        registered = frozenset(entities.entities)
+        # An id is taken if anything answers to it - registry entries, and the
+        # state-machine-only entities (YAML templates and groups without a
+        # unique_id) the registry knows nothing about. Landing on either
+        # makes the recorder drop the history instead of migrating it.
+        registered = frozenset(entities.entities) | frozenset(self.hass.states.async_entity_ids())
         planned: list[IdChange] = []
         claimed: set[str] = set()
         for target in targets:
@@ -497,7 +518,17 @@ class Curator:
                 "Entity id %s -> %s refused: %s",
                 refusal.entity_id, refusal.new_entity_id, refusal.why,
             )
-        if dry_run or not ids.renames:
+        if dry_run:
+            ids.would_rewrite = tuple(
+                dict.fromkeys(
+                    reference
+                    for old in ids.renames
+                    for reference in found.get(old, ())
+                    if reference.rewritable
+                )
+            )
+            return ids
+        if not ids.renames:
             return ids
 
         # References first: a rewritten reference pointing at an id that does
@@ -514,6 +545,7 @@ class Curator:
                 reference.where, reference.kind,
             )
         entities = er.async_get(self.hass)
+        failed: dict[str, str] = {}
         self._applying = True
         try:
             for old, new in list(ids.renames.items()):
@@ -532,11 +564,21 @@ class Curator:
                     del ids.renames[old]
                     ids.reasons.pop(old, None)
                     ids.refusals.append(IdRefusal(old, new, f"registry refused it: {err}"))
+                    failed[new] = old
                     _LOGGER.error("Entity id %s -> %s failed: %s", old, new, err)
                 else:
                     _LOGGER.info("Entity id %s -> %s (%s)", old, new, ids.reasons.get(old))
         finally:
             self._applying = False
+        if failed:
+            # The references were already pointed at ids that will now never
+            # exist. Put them back, so a refused rename leaves every file and
+            # entry exactly as it found it.
+            restored = await references.async_rewrite_references(self.hass, failed)
+            ids.rewritten = tuple(r for r in ids.rewritten if r not in restored)
+            _LOGGER.warning(
+                "Rolled back %d reference(s) for %d refused rename(s)", len(restored), len(failed)
+            )
         return ids
 
     async def async_curate_ids(
