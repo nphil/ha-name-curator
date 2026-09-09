@@ -5,3 +5,16 @@ curate:
       default: false
       selector:
         boolean:
+
+curate_ids:
+  fields:
+    device_id:
+      required: false
+      selector:
+        device:
+          multiple: true
+    dry_run:
+      required: false
+      default: true
+      selector:
+        boolean:

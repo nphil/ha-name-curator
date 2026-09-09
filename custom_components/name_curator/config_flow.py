@@ -52,6 +52,8 @@ def _options_schema(options: logic.Options) -> vol.Schema:
                 selector.BooleanSelector(),
             vol.Required(logic.OPTION_ASSIST_ALIASES, default=options.assist_aliases):
                 selector.BooleanSelector(),
+            vol.Required(logic.OPTION_RENAME_ENTITY_IDS, default=options.rename_entity_ids):
+                selector.BooleanSelector(),
             vol.Optional(
                 logic.OPTION_EXCLUDED_DEVICE_CLASSES,
                 default=sorted(options.excluded_device_classes),
@@ -109,7 +111,8 @@ class NameCuratorOptionsFlow(config_entries.OptionsFlow):
             saved.setdefault(logic.OPTION_EXCLUDED_DEVICE_CLASSES, [])
             saved.setdefault(logic.OPTION_EXCLUDED_DOMAINS, [])
             return self.async_create_entry(title="", data=saved)
+        stored = self.config_entry.options
         return self.async_show_form(
             step_id="init",
-            data_schema=_options_schema(logic.options_from_mapping(self.config_entry.options)),
+            data_schema=_options_schema(logic.options_from_mapping(stored)),
         )

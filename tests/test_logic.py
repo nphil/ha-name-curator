@@ -202,6 +202,142 @@ class TestPlan:
         assert not logic.plan(after, OPTS)
 
 
+class TestComposeObjectId:
+    def test_thing_repeating_the_area_collapses_to_one_prefix(self):
+        assert (
+            logic.compose_object_id("nitin_s_office", "nitin_s_standing_desk", "height")
+            == "nitin_s_office_standing_desk_height"
+        )
+
+    def test_unrelated_thing_keeps_every_token(self):
+        assert logic.compose_object_id("living_room", "vent_fan", "speed") == "living_room_vent_fan_speed"
+
+    def test_collapsing_is_whole_tokens_only(self):
+        assert logic.compose_object_id("room", "roomba", "battery") == "room_roomba_battery"
+
+    def test_missing_thing_or_suffix_contributes_nothing(self):
+        assert logic.compose_object_id("kitchen", "humidity_sensor", "") == "kitchen_humidity_sensor"
+        assert logic.compose_object_id("nitin_s_office", "", "occupancy") == "nitin_s_office_occupancy"
+        assert logic.compose_object_id("", "roborock_s8", "battery") == "roborock_s8_battery"
+
+    def test_thing_identical_to_the_area_leaves_the_area_standing(self):
+        assert logic.compose_object_id("nitin_s_office", "nitin_s_office", "") == "nitin_s_office"
+
+    def test_refuses_to_mint_an_empty_object_id(self):
+        with pytest.raises(ValueError):
+            logic.compose_object_id("", "", "")
+
+
+def _plan_id(
+    entity_id,
+    *,
+    area="nitin_s_office",
+    thing="nitin_s_standing_desk",
+    suffix="height",
+    stems=("uplift_desk",),
+    taken=(),
+):
+    """The standing desk: integration "Uplift Desk", renamed "Nitin's Standing Desk"."""
+    return logic.plan_entity_id(
+        entity_id,
+        area_slug=area,
+        thing_slug=thing,
+        suffix_slug=suffix,
+        stem_slugs=stems,
+        taken=frozenset(taken),
+    )
+
+
+class TestPlanEntityId:
+    def test_conventional_id_is_left_alone(self):
+        assert _plan_id("sensor.nitin_s_office_standing_desk_height") is None
+
+    def test_id_minted_from_the_integration_name_follows_the_rename(self):
+        assert _plan_id("sensor.uplift_desk_height") == logic.IdChange(
+            "sensor.uplift_desk_height",
+            "sensor.nitin_s_office_standing_desk_height",
+            logic.ID_REASON_INTEGRATION_NAME,
+            False,
+        )
+
+    def test_id_spelling_a_dropped_display_name_is_stale_not_integration(self):
+        change = _plan_id(
+            "sensor.nitin_s_office_sit_stand_desk_height", stems=("uplift_desk", "sit_stand_desk")
+        )
+        assert change.new_entity_id == "sensor.nitin_s_office_standing_desk_height"
+        assert change.reason == logic.ID_REASON_STALE_THING
+
+    def test_unrecognised_id_is_never_guessed_at(self):
+        # An id the operator minted by hand. It lacks the area prefix and its
+        # tail is the right suffix, which is all the prototype rule looked at
+        # before it flagged 947 of 4016 entities. No stem, no rename.
+        assert _plan_id("sensor.office_desk_height", stems=("uplift_desk", "nitin_s_standing_desk")) is None
+        # A Z-Wave node nobody has ever renamed: same answer.
+        assert logic.plan_entity_id(
+            "sensor.node_014_air_temperature",
+            area_slug="kitchen",
+            thing_slug="fridge_sensor",
+            suffix_slug="air_temperature",
+            stem_slugs=("zooz_zse44",),
+            taken=frozenset(),
+        ) is None
+        # A legacy id that is nothing but its suffix names no device at all.
+        assert logic.plan_entity_id(
+            "sensor.temperature",
+            area_slug="kitchen",
+            thing_slug="fridge_sensor",
+            suffix_slug="temperature",
+            stem_slugs=("zooz_zse44",),
+            taken=frozenset(),
+        ) is None
+
+    def test_missing_integration_name_matches_nothing(self):
+        assert _plan_id("sensor.uplift_desk_height", stems=("",)) is None
+
+    def test_suffix_that_is_not_the_remainder_is_left_alone(self):
+        assert _plan_id("sensor.uplift_desk_position") is None
+
+    def test_entity_without_a_name_of_its_own_renames_only_when_nothing_trails(self):
+        assert _plan_id("switch.uplift_desk", suffix="") == logic.IdChange(
+            "switch.uplift_desk",
+            "switch.nitin_s_office_standing_desk",
+            logic.ID_REASON_INTEGRATION_NAME,
+            False,
+        )
+        # Dropping "child_lock" would land on the id above and eat its history.
+        assert _plan_id("switch.uplift_desk_child_lock", suffix="") is None
+
+    def test_longest_stem_wins_over_a_shorter_one_that_also_fits(self):
+        change = _plan_id("sensor.uplift_desk_height", stems=("uplift", "uplift_desk"))
+        assert change.new_entity_id == "sensor.nitin_s_office_standing_desk_height"
+
+    def test_taken_target_is_reported_and_flagged_rather_than_dropped(self):
+        change = _plan_id(
+            "sensor.uplift_desk_height", taken=("sensor.nitin_s_office_standing_desk_height",)
+        )
+        assert change.conflict is True
+        assert change.new_entity_id == "sensor.nitin_s_office_standing_desk_height"
+
+    def test_area_change_recomposes_a_thing_that_did_not_change(self):
+        change = logic.plan_entity_id(
+            "sensor.living_room_air_purifier_pm2_5",
+            area_slug="nitin_s_office",
+            thing_slug="air_purifier",
+            suffix_slug="pm2_5",
+            stem_slugs=("winix_c545", "living_room_air_purifier"),
+            taken=frozenset(),
+        )
+        assert change.new_entity_id == "sensor.nitin_s_office_air_purifier_pm2_5"
+        assert change.reason == logic.ID_REASON_STALE_THING
+
+    def test_device_with_no_area_yet_still_gets_its_new_name(self):
+        change = _plan_id("sensor.uplift_desk_height", area="")
+        assert change.new_entity_id == "sensor.nitin_s_standing_desk_height"
+
+    def test_nothing_to_compose_leaves_the_id_alone(self):
+        assert _plan_id("sensor.uplift_desk_height", area="", thing="", suffix="") is None
+
+
 def test_options_from_mapping_defaults_and_clamps():
     opts = logic.options_from_mapping(None)
     assert opts.excluded_device_classes == {"door", "garage_door"}

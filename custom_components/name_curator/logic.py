@@ -10,9 +10,14 @@ grouped view already shows, so it is stripped from the *displayed* name:
   override, or an integration that never opted into ``has_entity_name``) gets a
   registry ``name`` override.
 
-Entity ids, unique ids and statistics are never touched. The frontend's own
-prefix stripping (``stripPrefixFromEntityName``) defines what counts as a
-prefix: the area name followed by " ", ": " or " - ", compared case-insensitively.
+Unique ids are never touched. Entity ids are, but only on evidence: see
+``plan_entity_id``, which rewrites an id solely when the id itself still spells
+a name the device has moved on from. The recorder migrates that entity's
+history and long-term statistics for us when it does.
+
+The frontend's own prefix stripping (``stripPrefixFromEntityName``) defines
+what counts as a prefix: the area name followed by " ", ": " or " - ",
+compared case-insensitively.
 Area aliases count too, so an area "Nitin's Office" aliased "Office" also
 shortens "Office Canvas Lights".
 """
@@ -33,6 +38,7 @@ OPTION_EXCLUDED_DEVICE_CLASSES = "excluded_device_classes"
 OPTION_EXCLUDED_DOMAINS = "excluded_domains"
 OPTION_NOTIFY = "notify"
 OPTION_DEBOUNCE_SECONDS = "debounce_seconds"
+OPTION_RENAME_ENTITY_IDS = "rename_entity_ids"
 
 # Doors read as "<Location> Door" by house rule: never shorten them.
 DEFAULT_EXCLUDED_DEVICE_CLASSES = ("door", "garage_door")
@@ -41,6 +47,12 @@ DEFAULT_EXCLUDED_DEVICE_CLASSES = ("door", "garage_door")
 DEFAULT_EXCLUDED_DOMAINS = ("automation", "script", "scene")
 MIN_DEBOUNCE_SECONDS = 0
 MAX_DEBOUNCE_SECONDS = 300
+
+# Why an id is being rewritten. The operator reads these in the notification:
+# the first is a device rename that never reached the ids it minted, the second
+# is an id still spelling a display name the device has since dropped.
+ID_REASON_INTEGRATION_NAME = "integration_name"
+ID_REASON_STALE_THING = "stale_thing"
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,7 @@ class Options:
     excluded_domains: frozenset[str] = frozenset(DEFAULT_EXCLUDED_DOMAINS)
     notify: bool = True
     debounce_seconds: int = 5
+    rename_entity_ids: bool = True
 
 
 def _string_set(raw, key: str, default: tuple[str, ...]) -> frozenset[str]:
@@ -71,6 +84,7 @@ def options_from_mapping(raw) -> Options:
         strip_entities=bool(raw.get(OPTION_STRIP_ENTITIES, True)),
         restore_on_move=bool(raw.get(OPTION_RESTORE_ON_MOVE, True)),
         assist_aliases=bool(raw.get(OPTION_ASSIST_ALIASES, True)),
+        rename_entity_ids=bool(raw.get(OPTION_RENAME_ENTITY_IDS, True)),
         excluded_device_classes=_string_set(
             raw, OPTION_EXCLUDED_DEVICE_CLASSES, DEFAULT_EXCLUDED_DEVICE_CLASSES
         ),
@@ -165,6 +179,14 @@ class EntityChange:
 class AliasChange:
     entity_id: str
     alias: str
+
+
+@dataclass(frozen=True)
+class IdChange:
+    entity_id: str
+    new_entity_id: str
+    reason: str  # one of the ID_REASON_* constants
+    conflict: bool  # target id already in use; the caller must not apply it
 
 
 @dataclass
@@ -283,6 +305,94 @@ def plan_entity(entity: Entity, area: Area | None, options: Options) -> EntityCh
     if stripped is None or stripped == current:
         return None
     return EntityChange(entity.entity_id, current, stripped)
+
+
+def compose_object_id(area_slug: str, thing_slug: str, suffix_slug: str) -> str:
+    """Build the object id the house convention asks for: area, thing, suffix.
+
+    Slugs arrive pre-slugified because ``homeassistant.util.slugify`` is the one
+    thing allowed to decide what a slug looks like, and it lives on the HA side.
+
+    Leading tokens of the thing that the area already contributed are dropped,
+    so area "Nitin's Office" with device "Nitin's Standing Desk" gives
+    ``nitin_s_office_standing_desk`` rather than stuttering the possessive.
+    Whole underscore-delimited tokens only, so a "Roomba" in the "Room" area
+    keeps its name. An empty thing or suffix simply contributes nothing.
+
+    Raises ValueError when every part is empty: there is no object id to build,
+    and minting a bare "sensor." would be far worse than refusing.
+    """
+    area = [token for token in area_slug.split("_") if token]
+    thing = [token for token in thing_slug.split("_") if token]
+    collapsed = 0
+    while collapsed < len(thing) and thing[collapsed] in area:
+        collapsed += 1
+    tokens = [*area, *thing[collapsed:], *(t for t in suffix_slug.split("_") if t)]
+    if not tokens:
+        raise ValueError("no object id can be composed from empty parts")
+    return "_".join(tokens)
+
+
+def plan_entity_id(
+    entity_id: str,
+    *,
+    area_slug: str,
+    thing_slug: str,
+    suffix_slug: str,
+    stem_slugs: tuple[str, ...],
+    taken: frozenset[str],
+) -> IdChange | None:
+    """Rewrite an entity id only when the id itself proves a rename was missed.
+
+    ``stem_slugs`` are the names this id could legitimately be spelling today:
+    the integration's own device name first (pass "" when it has none), then
+    previous display names and previous "<area> <thing>" forms. The id has to
+    begin with one of them -- bare, or with the area slug in front -- and what
+    follows has to be exactly the entity's suffix. Anything else returns None.
+
+    That refusal is the whole point. A prototype rule that instead inferred
+    "this id lacks its area prefix, so a rename must have been missed" flagged
+    947 of 4016 live entities here: every Z-Wave node, both robot vacuums, the
+    washer and the dryer -- all named by their integration and never renamed by
+    anybody. Recognising a *previous* name inside the id is the only evidence
+    that a rename really did happen and failed to propagate, so it is the only
+    thing that licenses touching an id.
+
+    A returned change is not automatically safe to apply. ``conflict`` marks a
+    target already in ``taken``: the recorder refuses to migrate history onto an
+    id in use ("Cannot migrate history ... already in use") and drops it, so the
+    caller reports those and leaves the entity alone.
+    """
+    if not (area_slug or thing_slug or suffix_slug):
+        return None
+    domain, _, object_id = entity_id.partition(".")
+    conventional = compose_object_id(area_slug, thing_slug, suffix_slug)
+    if object_id == conventional:
+        return None
+
+    matched = ""
+    from_integration = False
+    for index, stem in enumerate(stem_slugs):
+        if not stem:
+            continue
+        for candidate in (f"{area_slug}_{stem}", stem) if area_slug else (stem,):
+            if len(candidate) <= len(matched):
+                continue
+            if object_id == candidate or object_id.startswith(f"{candidate}_"):
+                matched = candidate
+                from_integration = index == 0
+    if not matched:
+        return None
+    if object_id.removeprefix(matched).removeprefix("_") != suffix_slug:
+        return None
+
+    new_entity_id = f"{domain}.{conventional}"
+    return IdChange(
+        entity_id,
+        new_entity_id,
+        ID_REASON_INTEGRATION_NAME if from_integration else ID_REASON_STALE_THING,
+        new_entity_id in taken,
+    )
 
 
 def plan(snapshot: Snapshot, options: Options) -> Plan:
