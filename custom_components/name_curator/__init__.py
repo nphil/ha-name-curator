@@ -195,6 +195,8 @@ class Curator:
         # Source-change handlers sleep through the settle window; an unload
         # must not leave one to wake on a dead curator and rename anyway.
         self._inflight: set[asyncio.Task[None]] = set()
+        # Devices whose entity-create burst is still settling; one pass each.
+        self._settling: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -259,25 +261,42 @@ class Curator:
             # collides into …_2 …_6. The device carried no event, so only
             # the entity's own creation can trigger the fix.
             if self.options.rename_entity_ids:
-                task = self.hass.async_create_task(self._async_handle_new_entity(data["entity_id"]))
-                self._inflight.add(task)
-                task.add_done_callback(self._inflight.discard)
+                # One task per device per burst: a platform adding twenty
+                # entities fires twenty creates, and each would otherwise
+                # sleep, queue on the lock, re-plan the same device and post
+                # its own notification. The first create claims the device;
+                # the settle window lets the rest of the burst land before
+                # the plan runs, so nothing is missed by coalescing.
+                device_id = er.async_get(self.hass).async_get(data["entity_id"])
+                device_id = device_id.device_id if device_id else None
+                if device_id and device_id not in self._settling:
+                    self._settling.add(device_id)
+                    task = self.hass.async_create_task(self._async_handle_new_entity(device_id))
+                    self._inflight.add(task)
+                    task.add_done_callback(self._inflight.discard)
             self._schedule()
         elif data["action"] == "update" and ENTITY_FIELDS & set(data.get("changes", {})):
             self._schedule()
 
-    async def _async_handle_new_entity(self, entity_id: str) -> None:
-        """Bring a freshly minted entity's id to convention."""
-        # Platforms add their entities in a burst; let the whole device land.
-        await asyncio.sleep(ID_SETTLE_SECONDS)
+    async def _async_handle_new_entity(self, device_id: str) -> None:
+        """Bring a device's freshly minted ids to convention."""
+        try:
+            # Platforms add their entities in a burst; let the whole device land.
+            await asyncio.sleep(ID_SETTLE_SECONDS)
+        finally:
+            # Released before the plan, so a create arriving *during* the
+            # plan queues a fresh pass rather than being lost.
+            self._settling.discard(device_id)
         async with self._lock:
-            entry = er.async_get(self.hass).async_get(entity_id)
-            if entry is None or entry.device_id is None:
+            device = dr.async_get(self.hass).async_get(device_id)
+            if device is None:
                 return
-            device = dr.async_get(self.hass).async_get(entry.device_id)
-            if device is None or not (entry.area_id or device.area_id):
+            entities = er.async_get(self.hass)
+            if not (device.area_id or any(
+                e.area_id for e in er.async_entries_for_device(entities, device_id, include_disabled_entities=True)
+            )):
                 return
-            ids = await self._async_curate_ids([IdTarget(device.id)], dry_run=False)
+            ids = await self._async_curate_ids([IdTarget(device_id)], dry_run=False)
         if ids and self.options.notify:
             self._report(Plan(), ids, self._snapshot(), dry_run=False)
 
