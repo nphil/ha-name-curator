@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Name Curator">
+  <title>Name Curator</title>
+  <!-- Same geometry as tools/render_brand.py (light variant). -->
+  <rect width="256" height="256" rx="56" fill="#0E9384"/>
+  <!-- the label: a rounded tag pointing right -->
+  <polygon points="48,92 148,92 200,128 148,164 48,164" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="24" stroke-linejoin="round"/>
+  <!-- string hole -->
+  <circle cx="168" cy="128" r="9" fill="#0E9384"/>
+  <!-- text cursor: the name being edited -->
+  <g stroke="#0E9384" stroke-width="12" stroke-linecap="round" fill="none">
+    <line x1="92" y1="106" x2="92" y2="150"/>
+    <line x1="76" y1="106" x2="108" y2="106"/>
+    <line x1="76" y1="150" x2="108" y2="150"/>
+  </g>
+</svg>
