@@ -24,12 +24,24 @@ Whenever a device is created, renamed, moved to an area, or an area is renamed:
   area's aliases) get a user name without that prefix. The integration's own
   name is kept underneath — Zigbee2MQTT, Z-Wave JS or the vendor app still see
   what you typed.
-- **Entities** whose displayed name does *not* follow their device — an explicit
-  name override, or an integration that never adopted device-based naming
-  (Lutron Caséta, for one) — get a name override without the prefix. Entities
-  that derive their name from the device follow it automatically.
-- **Assist aliases**: for entities exposed to Assist, the old friendly name is
-  kept as an alias so "turn on the living room vent fan" keeps working.
+- **Entities** whose displayed name still carries the room get a name override
+  without it: an explicit override, or an integration that never adopted
+  device-based naming (Lutron Caséta, for one). Entities that derive their name
+  from the device follow it automatically.
+  From Home Assistant 2026.11 an entity's name is shown after its device's
+  name, so the override is only the entity's own part: a Pico button reads
+  *Coffee Table Pico On* with the override *On*, and an entity that is the
+  whole device gets an empty name. When the curator shortens a device it
+  writes those parts in the same pass, so nothing ever reads
+  *Coffee Table Pico Living Room Coffee Table Pico On*. Before 2026.11 the
+  override is the whole name, as it always was; the curator detects which
+  rules the running Core uses.
+- **Child devices** (the parts of a power strip or a multi-endpoint Z-Wave
+  device, from 2026.11) are shortened under the area they inherit from their
+  parent.
+- **Assist aliases**: for entities exposed to Assist, the name Home Assistant
+  showed before the change is kept as an alias so "turn on the living room
+  vent fan" keeps working.
 - **Restore on move**: if a device Name Curator shortened is later moved out of
   that area, its integration name is put back rather than leaving a bare
   *Vent Fan* with no room attached. Names you chose yourself are never restored.
@@ -93,15 +105,12 @@ UI, or an integration renames it upstream — and it considers **only the
 entities of that one device**. `name_curator.curate` (the full pass) never
 touches an id at all.
 
-A **new entity appearing on a device that is already in an area** is handled
-the same way: Core mints its id from the device's *display* name, which this
-integration has deliberately stripped of the room, so the entity is born
-room-less (and, across identical devices in different rooms, numbered
-`_2`, `_3`…). The device fires no event for that, so the entity's own creation
-does — three seconds later, once the platform has finished adding its
-siblings, the device's ids are brought to convention. Core's collision counter
-is recognised and dropped; a genuine trailing number in a name (`preset_1`)
-is kept.
+A **new entity** on a device that is already in an area needs nothing from
+the curator: since 2026.9 Core builds a new id from the area, device and entity
+names, so it is born with its room (`sensor.plant_room_bluetooth_proxy_ghost_link_heals`).
+Versions up to 1.1.2 renamed such ids themselves; 1.2.0 leaves them to Core. Core's
+collision counter is still recognised and dropped when a rename is
+propagated; a genuine trailing number in a name (`preset_1`) is kept.
 
 The UI's own rename dialog also offers to rename entity ids, with its own
 registry calls right after the device update. The curator waits three seconds

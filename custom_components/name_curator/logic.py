@@ -6,9 +6,17 @@ Once the device is assigned to that area the prefix only repeats what every
 grouped view already shows, so it is stripped from the *displayed* name:
 
 * a device keeps its integration name and gets a ``name_by_user`` override;
-* an entity whose displayed name does not follow its device (an explicit name
-  override, or an integration that never opted into ``has_entity_name``) gets a
-  registry ``name`` override.
+* an entity whose displayed name still carries the room gets a registry
+  ``name`` override.
+
+What an entity's registry ``name`` means changed in Home Assistant 2026.11
+(entity registry 1.24), and both meanings are handled:
+
+* before, it was the whole displayed name ("Coffee Table Pico On");
+* since, it is only the entity's own part. Core shows it after the device's
+  name unless the entity has an area of its own, so the override is
+  "On" and an entity that is nothing but its device gets an empty name.
+  ``Snapshot.composed_names`` says which world the snapshot came from.
 
 Unique ids are never touched. Entity ids are, but only on evidence: see
 ``plan_entity_id``, which rewrites an id solely when the id itself still spells
@@ -111,7 +119,10 @@ class Device:
     id: str
     name: str | None  # what the integration calls it
     name_by_user: str | None
+    # The area the device is shown under. A child device (2026.9+) without an
+    # area of its own inherits its parent's, so this is the effective area.
     area_id: str | None
+    is_child: bool = False
 
     @property
     def display_name(self) -> str:
@@ -129,22 +140,42 @@ class Entity:
     disabled: bool = False
     entity_category: str | None = None
     device_class: str | None = None
-    friendly_name: str | None = None  # current state attribute, for the alias
-    aliases: tuple[str, ...] = ()
-    exposed_to_assist: bool = False
 
     def follows_device(self) -> bool:
-        """Does the friendly name derive from the device name?"""
+        """Before 2026.11: does the displayed name derive from the device name?"""
         return self.has_entity_name and self.name is None
+
+    def device_is_name_part(self) -> bool:
+        """Since 2026.11: does Core show the device's name in front of this one?
+
+        Mirrors Core's ``_entity_next_name_part``: an entity with an area of
+        its own is named on its own; otherwise its device leads.
+        """
+        return self.area_id is None and self.device_id is not None
 
     @property
     def own_display_name(self) -> str | None:
-        """The name shown when it does not follow the device."""
+        """Before 2026.11: the name shown when it does not follow the device."""
         if self.name is not None:
             return self.name
         if not self.has_entity_name:
             return self.original_name
         return None
+
+    def own_part(self, device_name: str | None) -> str | None:
+        """Since 2026.11: the part Core shows for this entity itself.
+
+        ``device_name`` is the device's displayed name at the moment in
+        question; Core takes it off the front of a legacy (not
+        ``has_entity_name``) integration name, and an entity that is only its
+        device comes out as "".
+        """
+        if self.name is not None:
+            return self.name
+        if self.has_entity_name or not device_name:
+            return self.original_name
+        unprefixed = strip_device_name(self.original_name or "", device_name)
+        return unprefixed if unprefixed is not None else self.original_name
 
 
 @dataclass(frozen=True)
@@ -152,6 +183,9 @@ class Snapshot:
     areas: dict[str, Area]
     devices: dict[str, Device]
     entities: dict[str, Entity]
+    # True from Home Assistant 2026.11: a registry ``name`` is the entity's
+    # own part and Core composes the device's name in front of it.
+    composed_names: bool = False
 
     def area_of_entity(self, entity: Entity) -> Area | None:
         area_id = entity.area_id
@@ -195,6 +229,10 @@ class Plan:
     devices: list[DeviceChange] = field(default_factory=list)
     entities: list[EntityChange] = field(default_factory=list)
     aliases: list[AliasChange] = field(default_factory=list)
+    # Entities whose displayed name this plan may change. Whether it really
+    # does, and what the old name was, is Core's call (its full-name helper),
+    # so the caller turns these into ``aliases`` around applying the plan.
+    alias_candidates: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.devices or self.entities or self.aliases)
@@ -228,6 +266,21 @@ def strip_prefix(name: str, prefixes: tuple[str, ...] | str) -> str | None:
                 rest = rest[0].upper() + rest[1:]
             return rest
     return None
+
+
+def strip_device_name(name: str, device_name: str) -> str | None:
+    """``name`` without a leading device name; "" when it is only that name.
+
+    None when ``name`` does not start with ``device_name``. This is the rule
+    Core 2026.11 applies when it shows an entity after its device: the device
+    name is not repeated, and an entity that *is* its device shows no part of
+    its own.
+    """
+    if not name or not device_name:
+        return None
+    if name.casefold() == device_name.casefold():
+        return ""
+    return strip_prefix(name, device_name)
 
 
 def plan_device(device: Device, area: Area | None, options: Options) -> DeviceChange | None:
@@ -306,6 +359,53 @@ def plan_entity(entity: Entity, area: Area | None, options: Options) -> EntityCh
     if stripped is None or stripped == current:
         return None
     return EntityChange(entity.entity_id, current, stripped)
+
+
+def plan_entity_part(
+    entity: Entity,
+    area: Area | None,
+    options: Options,
+    *,
+    device_name_now: str | None,
+    device_name_next: str | None,
+) -> EntityChange | None:
+    """Since 2026.11: the entity's own part, with no room and no repeated device.
+
+    ``device_name_now`` is the device's displayed name as Core sees it at
+    this moment; ``device_name_next`` is what it will be once this plan's
+    device renames are applied. Comparing the two matters: Core trims the
+    device name off a legacy integration name ("Living Room Pico On" on
+    device "Living Room Pico" shows as "Living Room Pico On"), but only
+    while the device still carries that name. Shorten the device to "Pico"
+    and the same entity would read "Pico Living Room Pico On", so it needs
+    an override of "On" in the same pass.
+    """
+    if not options.strip_entities or area is None:
+        return None
+    if entity.disabled or entity.entity_category is not None:
+        return None
+    if entity.device_class in options.excluded_device_classes:
+        return None
+    if entity.entity_id.partition(".")[0] in options.excluded_domains:
+        return None
+    leads = entity.device_is_name_part()
+    now = entity.own_part(device_name_now if leads else None)
+    if now is None:
+        return None
+    target = now
+    stripped = strip_prefix(now, area.prefixes) if now else None
+    if stripped is not None:
+        target = stripped
+        if leads and device_name_next:
+            rest = strip_device_name(target, device_name_next)
+            if rest is not None:
+                target = rest
+    after = entity.own_part(device_name_next if leads else None)
+    if target == after:
+        return None
+    # When only the device moved on, report what the entity would otherwise
+    # have read as, not "On -> On".
+    return EntityChange(entity.entity_id, now if now != target else (after or ""), target)
 
 
 def compose_object_id(area_slug: str, thing_slug: str, suffix_slug: str) -> str:
@@ -417,31 +517,35 @@ def plan_entity_id(
 def plan(snapshot: Snapshot, options: Options) -> Plan:
     """Everything that should change in the snapshot, in one pass."""
     result = Plan()
-    renamed_devices: set[str] = set()
+    next_names: dict[str, str] = {}
     for device in snapshot.devices.values():
         change = plan_device(device, snapshot.areas.get(device.area_id or ""), options)
         if change:
             result.devices.append(change)
-            renamed_devices.add(device.id)
+            next_names[device.id] = change.new or device.name or ""
 
     for entity in snapshot.entities.values():
         area = snapshot.area_of_entity(entity)
-        change = plan_entity(entity, area, options)
-        friendly_name_changes = change is not None or (
-            entity.follows_device()
-            and entity.device_id in renamed_devices
-            and not entity.disabled
-        )
+        device = snapshot.devices.get(entity.device_id or "")
+        if snapshot.composed_names:
+            now = device.display_name if device else None
+            change = plan_entity_part(
+                entity,
+                area,
+                options,
+                device_name_now=now,
+                device_name_next=next_names.get(device.id, now) if device else None,
+            )
+            shows_device = entity.device_is_name_part()
+        else:
+            change = plan_entity(entity, area, options)
+            shows_device = entity.follows_device()
         if change:
             result.entities.append(change)
-        if (
-            friendly_name_changes
-            and options.assist_aliases
-            and entity.exposed_to_assist
-            and entity.friendly_name
-            and entity.friendly_name not in entity.aliases
+        if options.assist_aliases and not entity.disabled and (
+            change is not None or (shows_device and entity.device_id in next_names)
         ):
-            result.aliases.append(AliasChange(entity.entity_id, entity.friendly_name))
+            result.alias_candidates.append(entity.entity_id)
     return result
 
 
@@ -463,7 +567,8 @@ def describe(plan_: Plan, snapshot: Snapshot, *, dry_run: bool = False) -> str:
         lines.append("")
         lines.append(f"**Entities** ({len(plan_.entities)} display names {verb} shortened; ids unchanged)")
         for change in plan_.entities:
-            lines.append(f"- `{change.entity_id}`: {change.old} → **{change.new}**")
+            new = f"**{change.new}**" if change.new else "*(shown by its device's name)*"
+            lines.append(f"- `{change.entity_id}`: {change.old or '(device name)'} → {new}")
     if plan_.aliases:
         lines.append("")
         lines.append(f"**Assist aliases** ({len(plan_.aliases)} old names kept for voice)")

@@ -7,8 +7,9 @@ assigned to the Dining Room area, its displayed name becomes **Humidity Sensor**
 
 - Devices get a user name without the area prefix; the integration's own name
   stays underneath
-- Entities that do not follow their device (name overrides, legacy naming) get a
-  display-name override without the prefix
+- Entities whose displayed name still carries the room get an override without
+  it, under Home Assistant 2026.11's device-then-entity naming as well as the
+  older rules
 - Rename or move a device later and **that device's entity ids follow too**:
   `sensor.living_room_clock_time` → `sensor.living_room_wall_clock_time`. Ids
   keep the area prefix on purpose — an id has no room heading above it

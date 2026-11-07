@@ -101,6 +101,17 @@ ID_REASON_LABELS = {
 }
 
 
+def names_are_composed() -> bool:
+    """Whether this Core shows an entity's registry ``name`` after its device's.
+
+    Home Assistant 2026.11 (entity registry 1.24) made a user-given name the
+    entity's own part, composed after the device name like integration names
+    already were; before, it was the whole displayed name. The storage
+    version is the switch Core itself migrated on, and it only ever grows.
+    """
+    return (er.STORAGE_VERSION_MAJOR, er.STORAGE_VERSION_MINOR) >= (1, 24)
+
+
 @dataclass(frozen=True)
 class IdTarget:
     """One device whose entity ids should be re-checked.
@@ -195,8 +206,6 @@ class Curator:
         # Source-change handlers sleep through the settle window; an unload
         # must not leave one to wake on a dead curator and rename anyway.
         self._inflight: set[asyncio.Task[None]] = set()
-        # Devices whose entity-create burst is still settling; one pass each.
-        self._settling: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -251,54 +260,13 @@ class Curator:
         if self._applying:
             return
         data = event.data
-        if data["action"] == "create":
-            # A device rename is not the only way an id ends up room-less.
-            # Core mints a new entity's id from the device's *display* name,
-            # which this integration has deliberately stripped of the room -
-            # so an entity added to a curated device later (a firmware update
-            # exposing a new sensor, an integration upgrade) is born as
-            # sensor.bluetooth_proxy_… and, across seven identical proxies,
-            # collides into …_2 …_6. The device carried no event, so only
-            # the entity's own creation can trigger the fix.
-            if self.options.rename_entity_ids:
-                # One task per device per burst: a platform adding twenty
-                # entities fires twenty creates, and each would otherwise
-                # sleep, queue on the lock, re-plan the same device and post
-                # its own notification. The first create claims the device;
-                # the settle window lets the rest of the burst land before
-                # the plan runs, so nothing is missed by coalescing.
-                device_id = er.async_get(self.hass).async_get(data["entity_id"])
-                device_id = device_id.device_id if device_id else None
-                if device_id and device_id not in self._settling:
-                    self._settling.add(device_id)
-                    task = self.hass.async_create_task(self._async_handle_new_entity(device_id))
-                    self._inflight.add(task)
-                    task.add_done_callback(self._inflight.discard)
+        # A new entity's id is Core's job: since 2026.9 it is built from the
+        # area, device and entity names, so it is born with its room. Only its
+        # displayed name can need the sweep.
+        if data["action"] == "create" or (
+            data["action"] == "update" and ENTITY_FIELDS & set(data.get("changes", {}))
+        ):
             self._schedule()
-        elif data["action"] == "update" and ENTITY_FIELDS & set(data.get("changes", {})):
-            self._schedule()
-
-    async def _async_handle_new_entity(self, device_id: str) -> None:
-        """Bring a device's freshly minted ids to convention."""
-        try:
-            # Platforms add their entities in a burst; let the whole device land.
-            await asyncio.sleep(ID_SETTLE_SECONDS)
-        finally:
-            # Released before the plan, so a create arriving *during* the
-            # plan queues a fresh pass rather than being lost.
-            self._settling.discard(device_id)
-        async with self._lock:
-            device = dr.async_get(self.hass).async_get(device_id)
-            if device is None:
-                return
-            entities = er.async_get(self.hass)
-            if not (device.area_id or any(
-                e.area_id for e in er.async_entries_for_device(entities, device_id, include_disabled_entities=True)
-            )):
-                return
-            ids = await self._async_curate_ids([IdTarget(device_id)], dry_run=False)
-        if ids and self.options.notify:
-            self._report(Plan(), ids, self._snapshot(), dry_run=False)
 
     @callback
     def _area_event(self, event: Event) -> None:
@@ -325,12 +293,30 @@ class Curator:
             area.id: Area(area.id, area.name, tuple(sorted(area.aliases)))
             for area in ar.async_get(self.hass).async_list_areas()
         }
+        registry = dr.async_get(self.hass)
         devices = {
             device.id: Device(device.id, device.name, device.name_by_user, device.area_id)
-            for device in dr.async_get(self.hass).devices  # iterating yields entries (2026.9+)
+            for device in registry.devices  # iterating yields main devices (2026.9+)
         }
+        entries = er.async_get(self.hass).entities.values()
+        # Child devices (2026.9+; used by Z-Wave, MQTT, ESPHome and Tuya from
+        # 2026.11) are not in that iteration. Pick up the ones that carry
+        # entities, under the area they are shown in: their own, or their
+        # parent's.
+        for entry in entries:
+            if entry.device_id is None or entry.device_id in devices:
+                continue
+            child = registry.async_get(entry.device_id)
+            if isinstance(child, dr.ChildDeviceEntry):
+                devices[child.id] = Device(
+                    child.id,
+                    child.name,
+                    child.name_by_user,
+                    dr.async_get_effective_area_id(self.hass, child),
+                    is_child=True,
+                )
         entities: dict[str, Entity] = {}
-        for entry in er.async_get(self.hass).entities.values():
+        for entry in entries:
             state = self.hass.states.get(entry.entity_id)
             entities[entry.entity_id] = Entity(
                 entity_id=entry.entity_id,
@@ -345,22 +331,55 @@ class Curator:
                 device_class=entry.device_class
                 or entry.original_device_class
                 or (state.attributes.get("device_class") if state else None),
-                friendly_name=state.attributes.get("friendly_name") if state else None,
-                # Ordered list; Core's COMPUTED_NAME sentinel is not a str.
-                aliases=tuple(a for a in entry.aliases if isinstance(a, str)),
-                # Stored Assist flag when present; otherwise leave it as a
-                # candidate and let async_curate's bounded check decide.
-                exposed_to_assist=bool(
-                    entry.options.get(ASSIST_DOMAIN, {}).get("should_expose", True)
-                ),
             )
-        return Snapshot(areas, devices, entities)
+        return Snapshot(areas, devices, entities, composed_names=names_are_composed())
 
     # -- actions -----------------------------------------------------------
 
     def _area(self, area_id: str | None) -> Area | None:
         entry = ar.async_get(self.hass).async_get_area(area_id) if area_id else None
         return Area(entry.id, entry.name, tuple(entry.aliases)) if entry else None
+
+    @callback
+    def _set_name_by_user(self, device: dr.DeviceEntry, name_by_user: str | None) -> None:
+        """Write a device's display override; child devices have their own call."""
+        registry = dr.async_get(self.hass)
+        if isinstance(device, dr.ChildDeviceEntry):
+            registry.async_update_child_device(device.id, name_by_user=name_by_user)
+        else:
+            registry.async_update_device(device.id, name_by_user=name_by_user)
+
+    @callback
+    def _full_name(self, entity_id: str) -> str:
+        """The name Core shows for an entity, under whichever rules this Core has."""
+        entry = er.async_get(self.hass).async_get(entity_id)
+        return er.async_get_full_entity_name(self.hass, entry) if entry else ""
+
+    @callback
+    def _aliases_to_keep(
+        self, before: dict[str, str], *, dry_run: bool
+    ) -> list[logic.AliasChange]:
+        """Old names of exposed entities that a rename has (or would have) changed.
+
+        ``before`` holds Core's own full names, read before the plan was
+        applied; the state's ``friendly_name`` is not used, because from 2026.11
+        it can lag behind the displayed name (Core keeps a pre-migration name
+        there) and it is on its way out. In a dry run nothing has changed yet,
+        so every exposed candidate is reported.
+        """
+        entities = er.async_get(self.hass)
+        keep: list[logic.AliasChange] = []
+        for entity_id, old in before.items():
+            entry = entities.async_get(entity_id)
+            if entry is None or not old or old in entry.aliases:
+                continue
+            if not dry_run and self._full_name(entity_id) == old:
+                continue
+            # Default-aware, and bounded to renamed entities on purpose:
+            # async_should_expose persists a default for whatever it is asked.
+            if async_should_expose(self.hass, ASSIST_DOMAIN, entity_id):
+                keep.append(logic.AliasChange(entity_id, old))
+        return keep
 
     async def _async_handle_source_change(self, device_id: str, changes: dict[str, Any]) -> None:
         """React to a device leaving its area, or being renamed.
@@ -370,14 +389,16 @@ class Curator:
         wait for the debounced sweep.
         """
         change = None
+        aliases: list[logic.AliasChange] = []
         async with self._lock:
             registry = dr.async_get(self.hass)
             device = registry.async_get(device_id)
             if device is None:
                 return
 
-            view = Device(device.id, device.name, device.name_by_user, device.area_id)
-            current = self._area(device.area_id)
+            area_id = dr.async_get_effective_area_id(self.hass, device)
+            view = Device(device.id, device.name, device.name_by_user, area_id)
+            current = self._area(area_id)
             if "area_id" in changes:
                 change = logic.plan_device_move(
                     view, self._area(changes["area_id"]), current, self.options
@@ -385,9 +406,15 @@ class Curator:
             if change is None and "name" in changes:
                 change = logic.plan_device_rename(view, changes["name"], current, self.options)
             if change is not None:
+                before = {
+                    entry.entity_id: self._full_name(entry.entity_id)
+                    for entry in er.async_entries_for_device(er.async_get(self.hass), device.id)
+                } if self.options.assist_aliases else {}
                 self._applying = True
                 try:
-                    registry.async_update_device(device.id, name_by_user=change.new)
+                    self._set_name_by_user(device, change.new)
+                    aliases = self._aliases_to_keep(before, dry_run=False)
+                    self._apply_aliases(aliases)
                 finally:
                     self._applying = False
                 _LOGGER.info(
@@ -417,14 +444,14 @@ class Curator:
                         IdTarget(
                             device_id,
                             previous_names,
-                            changes.get("area_id", device.area_id),
+                            changes.get("area_id", area_id),
                         )
                     ],
                     dry_run=False,
                 )
 
         if (change is not None or ids) and self.options.notify:
-            plan_ = Plan(devices=[change]) if change is not None else Plan()
+            plan_ = Plan(devices=[change], aliases=aliases) if change is not None else Plan()
             self._report(plan_, ids, self._snapshot(), dry_run=False)
 
     # -- entity ids --------------------------------------------------------
@@ -449,7 +476,10 @@ class Curator:
         # matches, so it is a placeholder, not a wildcard).
         integration = slugify(device.name) if device.name else ""
         rest: list[str] = []
-        areas = (self._area(device.area_id), self._area(target.previous_area_id))
+        areas = (
+            self._area(dr.async_get_effective_area_id(self.hass, device)),
+            self._area(target.previous_area_id),
+        )
         for name in (*target.previous_names, device.name, device.name_by_user):
             if not name:
                 continue
@@ -495,7 +525,9 @@ class Curator:
             ):
                 if entry.entity_id.partition(".")[0] in self.options.excluded_domains:
                     continue
-                area = self._area(entry.area_id or device.area_id)
+                area = self._area(
+                    entry.area_id or dr.async_get_effective_area_id(self.hass, device)
+                )
                 thing = device.name_by_user or device.name or ""
                 prefixes = (area.prefixes if area else ()) + (was.prefixes if was else ())
                 if prefixes and thing:
@@ -655,15 +687,18 @@ class Curator:
         async with self._lock:
             snapshot = self._snapshot()
             plan_ = logic.plan(snapshot, self.options)
-            if plan_.aliases:
-                # Default-aware check, bounded to entities already in the plan:
-                # async_should_expose persists a default for whatever it is asked.
-                plan_.aliases = [
-                    a for a in plan_.aliases
-                    if async_should_expose(self.hass, ASSIST_DOMAIN, a.entity_id)
-                ]
-            if plan_ and not dry_run:
+            # Core decides what a name now reads as, so read the old ones from
+            # it before anything moves.
+            before = {eid: self._full_name(eid) for eid in plan_.alias_candidates}
+            if (plan_.devices or plan_.entities) and not dry_run:
                 self._apply(plan_)
+            plan_.aliases = self._aliases_to_keep(before, dry_run=dry_run)
+            if plan_.aliases and not dry_run:
+                self._applying = True
+                try:
+                    self._apply_aliases(plan_.aliases)
+                finally:
+                    self._applying = False
             if plan_ or force_notify:
                 _LOGGER.info(
                     "%s%d device(s), %d entity name(s), %d alias(es)",
@@ -681,23 +716,27 @@ class Curator:
         self._applying = True
         try:
             for change in plan_.devices:
-                devices.async_update_device(change.device_id, name_by_user=change.new)
+                device = devices.async_get(change.device_id)
+                if device is None:
+                    continue
+                self._set_name_by_user(device, change.new)
                 _LOGGER.info("Device %s: %r -> %r", change.device_id, change.old, change.new)
             for change in plan_.entities:
                 entities.async_update_entity(change.entity_id, name=change.new)
                 _LOGGER.info("Entity %s: %r -> %r", change.entity_id, change.old, change.new)
-            for change in plan_.aliases:
-                entry = entities.async_get(change.entity_id)
-                if entry is None:
-                    continue
-                if change.alias in entry.aliases:
-                    continue
-                entities.async_update_entity(
-                    change.entity_id, aliases=[*entry.aliases, change.alias]
-                )
-                _LOGGER.info("Alias %s += %r", change.entity_id, change.alias)
         finally:
             self._applying = False
+
+    @callback
+    def _apply_aliases(self, aliases: Sequence[logic.AliasChange]) -> None:
+        """Append old names as Assist aliases. Caller sets ``_applying``."""
+        entities = er.async_get(self.hass)
+        for change in aliases:
+            entry = entities.async_get(change.entity_id)
+            if entry is None or change.alias in entry.aliases:
+                continue
+            entities.async_update_entity(change.entity_id, aliases=[*entry.aliases, change.alias])
+            _LOGGER.info("Alias %s += %r", change.entity_id, change.alias)
 
     def _report(
         self, plan_: Plan, ids: IdPlan, snapshot: Snapshot, *, dry_run: bool

@@ -1,6 +1,9 @@
 {
   "domain": "name_curator",
   "name": "Name Curator",
+  "categories": [
+    "helpers"
+  ],
   "codeowners": [
     "@nphil"
   ],
@@ -15,5 +18,5 @@
   "issue_tracker": "https://github.com/nphil/ha-name-curator/issues",
   "requirements": [],
   "single_config_entry": true,
-  "version": "1.1.2"
+  "version": "1.2.0"
 }

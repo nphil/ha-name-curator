@@ -172,33 +172,115 @@ class TestPlan:
         ent = _entity(entity_id="binary_sensor.g", device_id=None, area_id="kitchen", name="Kitchen Occupancy")
         assert logic.plan(_snapshot([], [ent]), OPTS).entities[0].new == "Occupancy"
 
-    def test_alias_added_for_exposed_entities_whose_friendly_name_changes(self):
+    def test_alias_candidates_are_renamed_entities_and_followers_of_renamed_devices(self):
         dev = logic.Device("d1", "Living Room Vent Fan", None, "living_room")
-        derived = _entity(entity_id="fan.v", friendly_name="Living Room Vent Fan", exposed_to_assist=True)
-        unexposed = _entity(entity_id="sensor.t", original_name="Temperature",
-                            friendly_name="Living Room Vent Fan Temperature")
-        override = _entity(entity_id="light.l", device_id=None, area_id="kitchen", name="Kitchen Lights",
-                           friendly_name="Kitchen Lights", exposed_to_assist=True)
-        untouched = _entity(entity_id="light.o", device_id="d2", friendly_name="Other", exposed_to_assist=True)
+        derived = _entity(entity_id="fan.v")
+        sensor = _entity(entity_id="sensor.t", original_name="Temperature")
+        override = _entity(entity_id="light.l", device_id=None, area_id="kitchen", name="Kitchen Lights")
+        untouched = _entity(entity_id="light.o", device_id="d2")
+        disabled = _entity(entity_id="fan.off", disabled=True)
         result = logic.plan(_snapshot([dev, logic.Device("d2", "Other", None, None)],
-                                      [derived, unexposed, override, untouched]), OPTS)
-        assert {(a.entity_id, a.alias) for a in result.aliases} == {
-            ("fan.v", "Living Room Vent Fan"), ("light.l", "Kitchen Lights"),
-        }
+                                      [derived, sensor, override, untouched, disabled]), OPTS)
+        assert sorted(result.alias_candidates) == ["fan.v", "light.l", "sensor.t"]
 
-    def test_existing_alias_not_duplicated_and_option_off(self):
+    def test_no_alias_candidates_when_option_off(self):
         dev = logic.Device("d1", "Living Room Vent Fan", None, "living_room")
-        ent = _entity(entity_id="fan.v", friendly_name="Living Room Vent Fan", exposed_to_assist=True,
-                      aliases=("Living Room Vent Fan",))
-        assert logic.plan(_snapshot([dev], [ent]), OPTS).aliases == []
-        ent2 = _entity(entity_id="fan.v", friendly_name="Living Room Vent Fan", exposed_to_assist=True)
-        assert logic.plan(_snapshot([dev], [ent2]), logic.Options(assist_aliases=False)).aliases == []
+        result = logic.plan(_snapshot([dev], [_entity(entity_id="fan.v")]), logic.Options(assist_aliases=False))
+        assert result.alias_candidates == []
 
     def test_idempotent(self):
         dev = logic.Device("d1", "Living Room Vent Fan", None, "living_room")
         snap = _snapshot([dev], [])
         first = logic.plan(snap, OPTS)
         after = _snapshot([logic.Device("d1", "Living Room Vent Fan", first.devices[0].new, "living_room")], [])
+        assert not logic.plan(after, OPTS)
+
+
+def _composed(devices, entities, areas=(LIVING, KITCHEN, OFFICE)):
+    return logic.Snapshot(
+        {a.id: a for a in areas},
+        {d.id: d for d in devices},
+        {e.entity_id: e for e in entities},
+        composed_names=True,
+    )
+
+
+class TestComposedNames:
+    """Home Assistant 2026.11+: a registry name is the entity's own part."""
+
+    def _pico(self, **kw):
+        base = dict(entity_id="button.living_room_coffee_table_pico_on", has_entity_name=False,
+                    original_name="Living Room Coffee Table Pico On")
+        base.update(kw)
+        return _entity(**base)
+
+    def test_shortening_a_device_keeps_its_legacy_entities_from_doubling(self):
+        # Core trims "Living Room Coffee Table Pico" off the button's name only
+        # while the device is still called that; renaming the device alone
+        # would show "Coffee Table Pico Living Room Coffee Table Pico On".
+        dev = logic.Device("d1", "Living Room Coffee Table Pico", None, "living_room")
+        result = logic.plan(_composed([dev], [self._pico()]), OPTS)
+        assert [c.new for c in result.devices] == ["Coffee Table Pico"]
+        assert [(c.old, c.new) for c in result.entities] == [("Living Room Coffee Table Pico On", "On")]
+
+    def test_new_legacy_entity_on_a_shortened_device_gets_only_its_own_part(self):
+        dev = logic.Device("d1", "Living Room Coffee Table Pico", "Coffee Table Pico", "living_room")
+        change = logic.plan(_composed([dev], [self._pico()]), OPTS).entities[0]
+        assert (change.old, change.new) == ("Living Room Coffee Table Pico On", "On")
+
+    def test_entity_that_is_its_device_gets_an_empty_part(self):
+        dev = logic.Device("d1", "Living Room Pico", "Pico", "living_room")
+        ent = self._pico(entity_id="light.living_room_pico", original_name="Living Room Pico")
+        assert logic.plan(_composed([dev], [ent]), OPTS).entities[0].new == ""
+
+    def test_migrated_override_is_left_alone(self):
+        # What Core's 1.24 migration leaves behind for curated entities.
+        dev = logic.Device("d1", "Living Room Coffee Table Pico", "Coffee Table Pico", "living_room")
+        plan = logic.plan(_composed([dev], [self._pico(name="On")]), OPTS)
+        assert not plan.entities and not plan.devices
+
+    def test_override_carrying_the_room_loses_room_and_device(self):
+        dev = logic.Device("d1", "Climate", None, "living_room")
+        ent = _entity(entity_id="sensor.c", name="Living Room Climate Temperature")
+        assert logic.plan(_composed([dev], [ent]), OPTS).entities[0].new == "Temperature"
+
+    def test_entity_with_its_own_area_is_named_alone(self):
+        # No device in front of it, so only the room comes off.
+        dev = logic.Device("d1", "Hub", None, "living_room")
+        ent = _entity(entity_id="light.k", area_id="kitchen", has_entity_name=False,
+                      original_name="Kitchen Hub Lights")
+        assert logic.plan(_composed([dev], [ent]), OPTS).entities[0].new == "Hub Lights"
+
+    def test_room_kept_in_device_name_is_not_moved_into_the_entity(self):
+        # strip_devices off: Core already shows "Living Room Pico On"; writing
+        # "Pico On" would make it "Living Room Pico Pico On".
+        dev = logic.Device("d1", "Living Room Pico", None, "living_room")
+        ent = self._pico(entity_id="button.p", original_name="Living Room Pico On")
+        assert not logic.plan(_composed([dev], [ent]), logic.Options(strip_devices=False)).entities
+
+    def test_integration_named_entities_are_untouched(self):
+        dev = logic.Device("d1", "Living Room Vent Fan", "Vent Fan", "living_room")
+        ent = _entity(entity_id="sensor.t", original_name="Temperature")
+        assert not logic.plan(_composed([dev], [ent]), OPTS).entities
+
+    def test_child_device_strips_under_its_inherited_area(self):
+        child = logic.Device("c1", "Living Room Lamp", None, "living_room", is_child=True)
+        assert [c.new for c in logic.plan(_composed([child], []), OPTS).devices] == ["Lamp"]
+
+    def test_every_entity_shown_after_a_renamed_device_is_an_alias_candidate(self):
+        dev = logic.Device("d1", "Living Room Coffee Table Pico", None, "living_room")
+        overridden = _entity(entity_id="button.x", has_entity_name=False, name="On")
+        own_area = _entity(entity_id="light.y", area_id="kitchen", original_name="Lamp")
+        result = logic.plan(_composed([dev], [overridden, own_area]), OPTS)
+        assert result.alias_candidates == ["button.x"]
+
+    def test_idempotent(self):
+        dev = logic.Device("d1", "Living Room Coffee Table Pico", None, "living_room")
+        first = logic.plan(_composed([dev], [self._pico()]), OPTS)
+        after = _composed(
+            [logic.Device("d1", "Living Room Coffee Table Pico", first.devices[0].new, "living_room")],
+            [self._pico(name=first.entities[0].new)],
+        )
         assert not logic.plan(after, OPTS)
 
 
